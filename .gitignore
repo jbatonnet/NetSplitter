@@ -1,0 +1,6 @@
+.vs/
+*.user
+packages/
+obj/
+bin/
+NetSplitter.log
