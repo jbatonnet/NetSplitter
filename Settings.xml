@@ -1,10 +1,9 @@
 ﻿<?xml version="1.0" encoding="utf-8" ?>
 <NetSplitter>
     <Settings>
-        <Port>17000</Port>
-        <Target Hostname="127.0.0.1" Port="17001" />
+        <Port>17001</Port>
+        <Target Hostname="127.0.0.1" Port="17000" />
     </Settings>
     <Output BufferSize="1048576" Timeout="1000">
-        <Target Hostname="127.0.0.1" Port="17002" />
     </Output>
 </NetSplitter>

@@ -251,7 +251,8 @@ namespace NetSplitter
 
                 try
                 {
-                    settingsDocument = XDocument.Load(settingsFileName);
+                    using (FileStream stream = File.Open(settingsFileName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        settingsDocument = XDocument.Load(stream);
                 }
                 catch (Exception ex)
                 {
@@ -375,7 +376,9 @@ namespace NetSplitter
                     Dictionary<TargetInfo, TargetConnection> outputTargets = currentOutputTargets.ToDictionary<TargetInfo, TargetInfo, TargetConnection>(t => t, t => null);
 
                     ClientConnection clientConnection = new ClientConnection(client, client.GetStream(), mainTarget, outputTargets);
-                    activeConnections.Add(clientConnection);
+
+                    lock (activeConnections)
+                        activeConnections.Add(clientConnection);
 
                     logger.Info($"Got connection from {clientEndPoint}, {activeConnections.Count} active connections");
 
@@ -413,7 +416,7 @@ namespace NetSplitter
                             {
                                 int read = clientConnection.Stream.Read(buffer, 0, buffer.Length);
                                 if (read == 0)
-                                    continue;
+                                    break;
 
                                 foreach (var targetInfo in outputTargets.ToArray())
                                 {
@@ -442,15 +445,22 @@ namespace NetSplitter
                         }
                         catch (Exception e)
                         {
-                            Try(client.Close);
                             Try(mainTarget.Connection.Close);
 
                             foreach (TargetConnection targetConnection in outputTargets.Values)
                                 if (targetConnection != null)
                                     Try(targetConnection.Connection.Close);
 
-                            if (activeConnections.Remove(clientConnection))
-                                logger.Info($"Lost connection from {clientEndPoint}, {activeConnections.Count} active connections");
+                            lock (activeConnections)
+                            {
+                                if (activeConnections.Remove(clientConnection))
+                                {
+                                    if (!(e is IOException) || !(e.InnerException is SocketException))
+                                        logger.Warn("Exception while reading from client. " + e);
+
+                                    logger.Info($"Lost connection from {clientEndPoint}, {activeConnections.Count} active connections");
+                                }
+                            }
                         }
                     }).Start();
 
@@ -465,7 +475,7 @@ namespace NetSplitter
                             {
                                 int read = mainTarget.Stream.Read(buffer, 0, buffer.Length);
                                 if (read == 0)
-                                    continue;
+                                    break;
 
                                 clientConnection.Stream.Write(buffer, 0, read);
                                 clientConnection.Stream.Flush();
@@ -474,14 +484,21 @@ namespace NetSplitter
                         catch (Exception e)
                         {
                             Try(client.Close);
-                            Try(mainTarget.Connection.Close);
 
                             foreach (TargetConnection targetConnection in outputTargets.Values)
                                 if (targetConnection != null)
                                     Try(targetConnection.Connection.Close);
 
-                            if (activeConnections.Remove(clientConnection))
-                                logger.Info($"Lost connection from {clientEndPoint}, {activeConnections.Count} active connections");
+                            lock (activeConnections)
+                            {
+                                if (activeConnections.Remove(clientConnection))
+                                {
+                                    if (!(e is IOException) || !(e.InnerException is SocketException))
+                                        logger.Warn("Exception while reading from target. " + e);
+
+                                    logger.Info($"Lost connection from {clientEndPoint}, {activeConnections.Count} active connections");
+                                }
+                            }
                         }
                     }).Start();
 
