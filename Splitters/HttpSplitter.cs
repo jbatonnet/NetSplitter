@@ -16,7 +16,7 @@ namespace NetSplitter
     {
         private const int bufferSize = 32 * 1024;
 
-        private static readonly ILog logger = new DefaultLogger(); // LogManager.GetLogger(typeof(TcpSplitter));
+        private static readonly ILog logger = new DefaultLogger(); // LogManager.GetLogger(typeof(HttpSplitter));
 
         public ushort Port { get; }
 
@@ -73,15 +73,18 @@ namespace NetSplitter
                     HostConnected?.Invoke(this, clientInfo);
 
                     // Create a HttpWebRequest
-                    /*Func<HttpWebRequest> requestBuilder = () =>
+                    Func<HostInfo, HttpWebRequest> requestBuilder = (HostInfo target) =>
                     {
-                        HttpWebRequest request = new HttpWebRequest();
+                        Uri uri = new Uri(new Uri($"http://{target.Hostname}:{target.Port}"), context.Request.Url);
+                        HttpWebRequest request = WebRequest.CreateHttp(uri);
 
                         foreach (string key in context.Request.Headers.Keys)
                             request.Headers.Add(key, context.Request.Headers[key]);
 
                         return request;
-                    };*/
+                    };
+
+                    requestBuilder(mainTargetInfo);
                 });
             }
             catch { }

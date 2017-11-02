@@ -4,13 +4,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Net;
-using System.Net.Sockets;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Threading;
-using System.Threading.Tasks;
-using System.Xml.Linq;
 
 using log4net;
 using log4net.Core;
@@ -27,8 +22,8 @@ namespace NetSplitter
     public enum BalancingMode
     {
         Random,
-        Consistent,
-        Balanced
+        IPHash,
+        LeastConn
     }
 
     class DefaultLogger : ILog
@@ -117,10 +112,12 @@ namespace NetSplitter
     {
         private const int defaultBufferSize = 1 * 1024 * 1024;
         private const int defaultTimeout = 1000;
-        private const BalancingMode defaultBalancingMode = BalancingMode.Balanced;
+        private const BalancingMode defaultBalancingMode = BalancingMode.LeastConn;
+
+        private const string settingsFileName = "Settings.json";
 
         public static SplitterMode SplitterMode { get; private set; } = SplitterMode.Tcp;
-        public static BalancingMode BalancingMode { get; private set; } = BalancingMode.Balanced;
+        public static BalancingMode BalancingMode { get; private set; } = BalancingMode.LeastConn;
 
         public static ushort Port { get; private set; } = 0;
         public static ulong BufferSize { get; private set; } = defaultBufferSize;
@@ -198,8 +195,6 @@ namespace NetSplitter
 
         private static void OnReloadConfiguration()
         {
-            const string settingsFileName = "Settings.json";
-
             if (!running)
                 return;
 
@@ -408,6 +403,9 @@ namespace NetSplitter
 
         private static HostInfo TargetBalancer(HostInfo source)
         {
+            if (balancingTargets.Count == 0)
+                return null;
+
             HostInfo target = null;
 
             if (BalancingMode == BalancingMode.Random)
@@ -426,16 +424,16 @@ namespace NetSplitter
                     }
                 }
             }
-            else if (BalancingMode == BalancingMode.Consistent)
+            else if (BalancingMode == BalancingMode.IPHash)
             {
                 int hash = source.Hostname.GetHashCode();
 
                 lock (balancingTargets)
                     target = balancingTargets.ElementAtOrDefault(hash % balancingTargets.Count).Key;
             }
-            else if (BalancingMode == BalancingMode.Balanced)
+            else if (BalancingMode == BalancingMode.LeastConn)
             {
-                target = currentBalancing.OrderBy(p => p.Value).FirstOrDefault().Key;
+                target = balancingTargets.OrderBy(p => currentBalancing[p.Key] / p.Value).FirstOrDefault().Key;
             }
 
             if (target != null)

@@ -62,8 +62,8 @@
   <ItemGroup>
     <Compile Include="Model\HostInfo.cs" />
     <Compile Include="Model\Splitter.cs" />
-    <Compile Include="Model\HttpSplitter.cs" />
-    <Compile Include="Model\TcpSplitter.cs" />
+    <Compile Include="Splitters\HttpSplitter.cs" />
+    <Compile Include="Splitters\TcpSplitter.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
