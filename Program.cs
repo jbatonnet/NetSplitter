@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -13,51 +14,21 @@ using System.Xml.Linq;
 
 using log4net;
 using log4net.Core;
+using Newtonsoft.Json.Linq;
+using PInvoke;
 
 namespace NetSplitter
 {
-    public class TargetInfo
+    public enum SplitterMode
     {
-        public string Hostname { get; }
-        public ushort Port { get; }
-
-        public TargetInfo(string hostname, ushort port)
-        {
-            Hostname = hostname;
-            Port = port;
-        }
+        Tcp,
+        Http
     }
-
-    public class TargetConnection
+    public enum BalancingMode
     {
-        public TargetInfo Target { get; }
-        public TcpClient Connection { get; }
-        public NetworkStream Stream { get; }
-
-        public ConcurrentQueue<ArraySegment<byte>> Buffers { get; } = new ConcurrentQueue<ArraySegment<byte>>();
-
-        public TargetConnection(TargetInfo target, TcpClient connection, NetworkStream stream)
-        {
-            Target = target;
-            Connection = connection;
-            Stream = stream;
-        }
-    }
-    public class ClientConnection
-    {
-        public TcpClient Connection { get; }
-        public NetworkStream Stream { get; }
-
-        public TargetConnection MainTarget { get; }
-        public Dictionary<TargetInfo, TargetConnection> OutputTargets { get; }
-
-        public ClientConnection(TcpClient connection, NetworkStream stream, TargetConnection mainTarget, Dictionary<TargetInfo, TargetConnection> outputTargets)
-        {
-            Connection = connection;
-            Stream = stream;
-            MainTarget = mainTarget;
-            OutputTargets = outputTargets;
-        }
+        Random,
+        Consistent,
+        Balanced
     }
 
     class DefaultLogger : ILog
@@ -142,30 +113,33 @@ namespace NetSplitter
         }
     }
 
-    class Program
+    public static class Program
     {
-        private delegate bool ConsoleEventDelegate(int eventType);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool SetConsoleCtrlHandler(ConsoleEventDelegate callback, bool add);
+        private const int defaultBufferSize = 1 * 1024 * 1024;
+        private const int defaultTimeout = 1000;
+        private const BalancingMode defaultBalancingMode = BalancingMode.Balanced;
 
-        private const int bufferSize = 32 * 1024;
-        private const string settingsFileName = "Settings.xml";
+        public static SplitterMode SplitterMode { get; private set; } = SplitterMode.Tcp;
+        public static BalancingMode BalancingMode { get; private set; } = BalancingMode.Balanced;
+
+        public static ushort Port { get; private set; } = 0;
+        public static ulong BufferSize { get; private set; } = defaultBufferSize;
+        public static TimeSpan Timeout { get; private set; } = TimeSpan.FromMilliseconds(defaultTimeout);
 
         private static readonly ILog logger = new DefaultLogger(); // LogManager.GetLogger(typeof(Program));
         private static FileSystemWatcher fileSystemWatcher;
-        private static TcpListener tcpListener;
-        private static ConsoleEventDelegate consoleCtrlHandler;
+        private static Kernel32.HandlerRoutine consoleCtrlHandler;
 
-        private static List<ClientConnection> activeConnections = new List<ClientConnection>();
+        private static Dictionary<HostInfo, double> balancingTargets = new Dictionary<HostInfo, double>();
+        private static List<HostInfo> cloningTargets = new List<HostInfo>();
+        private static Splitter splitter;
 
-        private static bool settingsLoaded = false;
-        private static ushort currentPort = 0;
-        private static ulong currentBufferSize = 1 * 1024 * 1024;
-        private static TimeSpan currentTimeout = TimeSpan.FromSeconds(5);
-        private static TargetInfo currentMainTarget;
-        private static TargetInfo[] currentOutputTargets;
+        private static bool running = true;
+        private static double balancingTargetsTotal;
+        private static Random balancingTargetsRandom = new Random();
 
-        private static bool exiting = false;
+        private static ConcurrentDictionary<HostInfo, int> currentBalancing = new ConcurrentDictionary<HostInfo, int>();
+        private static ConcurrentDictionary<HostInfo, HostInfo> activeConnections = new ConcurrentDictionary<HostInfo, HostInfo>();
 
         static void Main(string[] args)
         {
@@ -183,18 +157,26 @@ namespace NetSplitter
             fileSystemWatcher.EnableRaisingEvents = true;
 
             OnReloadConfiguration();
-            if (!settingsLoaded)
+            if (Port == 0 || splitter == null)
+            {
+                if (Debugger.IsAttached)
+                {
+                    Console.WriteLine("Press any key to continue . . . ");
+                    Console.ReadKey(true);
+                }
+
                 return;
+            }
 
             // Listen to control console handler
             consoleCtrlHandler = eventType =>
             {
-                if (!exiting)
+                if (running)
                 {
-                    logger.Info("Stopping TCP listener, waiting for active connections to stop. Use Ctrl+C again to force quit");
+                    logger.Warn("Stopping NetSplitter, waiting for active connections to stop. Use Ctrl+C again to force quit");
 
-                    exiting = true;
-                    tcpListener.Stop();
+                    running = false;
+                    splitter.Stop();
 
                     return false;
                 }
@@ -207,109 +189,35 @@ namespace NetSplitter
 
             Console.CancelKeyPress += (s, e) => e.Cancel = !consoleCtrlHandler(0);
             //if (Environment.OSVersion.Platform == PlatformID.Win32NT)
-            //    SetConsoleCtrlHandler(consoleCtrlHandler, true);
-
-            // Create listener
-            try
-            {
-                logger.Info($"Starting listener on port {currentPort} ...");
-
-                tcpListener = new TcpListener(IPAddress.Any, currentPort);
-                tcpListener.Start();
-
-                logger.Info("Listener started successfully");
-
-                tcpListener.BeginAcceptTcpClient(OnTcpConnection, null);
-            }
-            catch (Exception e)
-            {
-                logger.Error($"Error while starting TCP listener on port {currentPort}. " + e);
-            }
-
+            //    Kernel32.SetConsoleCtrlHandler(consoleCtrlHandler, true);
+            
             // Wait for all connections to stop
-            while (!exiting || activeConnections.Count > 0)
+            while (running || activeConnections.Count > 0)
                 Thread.Sleep(100);
         }
 
         private static void OnReloadConfiguration()
         {
-            ushort port = 0;
-            ulong bufferSize = currentBufferSize;
-            TimeSpan timeout = currentTimeout;
-            TargetInfo mainTarget;
-            List<TargetInfo> outputTargets = new List<TargetInfo>();
+            const string settingsFileName = "Settings.json";
 
-            logger.Info($"Reloading {settingsFileName} ...");
+            if (!running)
+                return;
 
+            JObject settingsObject;
+
+            // Load JSON settings object
             try
             {
                 if (!File.Exists(settingsFileName))
                     throw new Exception($"Could not find {settingsFileName} file");
 
-                // Load settings
-                XDocument settingsDocument;
+                string settingsJson;
 
-                try
-                {
-                    using (FileStream stream = File.Open(settingsFileName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                        settingsDocument = XDocument.Load(stream);
-                }
-                catch (Exception ex)
-                {
-                    throw new Exception($"Exception while loading {settingsFileName} file", ex);
-                }
+                using (FileStream fileStream = File.Open(settingsFileName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (StreamReader streamReader = new StreamReader(fileStream))
+                    settingsJson = streamReader.ReadToEnd();
 
-                {
-                    XElement settingsElement = settingsDocument.Root.Element("Settings");
-                    if (settingsDocument == null)
-                        throw new Exception("You must provide a Settings section");
-
-                    XElement portElement = settingsElement.Element("Port");
-                    if (portElement == null)
-                        throw new Exception("You must provide a Settings/Port element");
-
-                    if (!ushort.TryParse(portElement.Value, out port))
-                        throw new Exception("The port must be a positive number < 65536");
-
-                    if (settingsLoaded && (port != currentPort))
-                        throw new Exception("Can't live change listening port");
-                    
-                    XElement targetElement = settingsElement.Element("Target");
-                    if (targetElement == null)
-                        throw new Exception("You must provide a Settings/Target element");
-
-                    mainTarget = ReadTarget(targetElement);
-                }
-
-                {
-                    XElement outputElement = settingsDocument.Root.Element("Output");
-                    if (outputElement != null)
-                    {
-                        XAttribute bufferSizeAttribute = outputElement.Attribute("BufferSize");
-                        if (bufferSizeAttribute != null)
-                        {
-                            if (!ulong.TryParse(bufferSizeAttribute.Value, out bufferSize))
-                                throw new Exception("The specified BufferSize must be a positive integer number");
-                        }
-
-                        XAttribute timeoutAttribute = outputElement.Attribute("Timeout");
-                        if (timeoutAttribute != null)
-                        {
-                            ulong timeoutValue;
-                            if (!ulong.TryParse(timeoutAttribute.Value, out timeoutValue))
-                                throw new Exception("The specified Timeout must be a positive integer number");
-
-                            timeout = TimeSpan.FromMilliseconds(timeoutValue);
-                        }
-
-                        XElement[] targetElements = outputElement.Elements("Target")?.ToArray();
-                        if (targetElements != null)
-                        {
-                            foreach (XElement targetElement in targetElements)
-                                outputTargets.Add(ReadTarget(targetElement));
-                        }
-                    }
-                }
+                settingsObject = JObject.Parse(settingsJson);
             }
             catch (Exception ex)
             {
@@ -317,293 +225,242 @@ namespace NetSplitter
                 return;
             }
 
-            // Apply new settings
-            currentPort = port;
-            if (!settingsLoaded)
-                logger.Info($"Setting Port to {port}");
-
-            if (currentMainTarget == null || currentMainTarget.Hostname != mainTarget.Hostname || currentMainTarget.Port != mainTarget.Port)
-            {
-                logger.Info($"Setting MainTarget to {mainTarget.Hostname}:{mainTarget.Port}");
-                currentMainTarget = mainTarget;
-            }
-
-            if (bufferSize != currentBufferSize)
-            {
-                logger.Info($"Setting BufferSize to {bufferSize}");
-                currentBufferSize = bufferSize;
-            }
-
-            if (timeout != currentTimeout)
-            {
-                logger.Info($"Setting Timeout to {timeout}");
-                currentTimeout = timeout;
-            }
-
-            logger.Info($"Updating OutputTargets ({outputTargets?.Count ?? 0} items)");
-            currentOutputTargets = outputTargets?.ToArray() ?? new TargetInfo[0];
-
-            settingsLoaded = true;
-        }
-        private static void OnTcpConnection(IAsyncResult asyncResult)
-        {
-            if (exiting)
-                return;
-
             try
             {
-                // Accept client
-                TcpClient client = tcpListener.EndAcceptTcpClient(asyncResult);
-                EndPoint clientEndPoint = client.Client.RemoteEndPoint;
+                // Parse settings
+                Dictionary<HostInfo, double> newBalancingTargets = new Dictionary<HostInfo, double>();
 
-                new Thread(() =>
+                JArray balancingArray = settingsObject["Balancing"] as JArray;
+                if (balancingArray != null)
                 {
-                    // Connect to main server
-                    TargetInfo mainTargetInfo = currentMainTarget;
-                    TargetConnection mainTarget;
-
-                    try
+                    foreach (JObject targetObject in balancingArray)
                     {
-                        TcpClient mainTargetConnection = new TcpClient(mainTargetInfo.Hostname, mainTargetInfo.Port);
-                        mainTarget = new TargetConnection(mainTargetInfo, mainTargetConnection, mainTargetConnection.GetStream());
+                        string hostname = (targetObject["Hostname"] as JValue)?.Value<string>();
+                        ushort? port = (targetObject["Port"] as JValue)?.Value<ushort>();
+                        double weight = (targetObject["Weight"] as JValue)?.Value<double>() ?? 1;
+                        bool enabled = (targetObject["Enabled"] as JValue)?.Value<bool>() ?? true;
+
+                        if (!enabled)
+                            continue;
+                        if (string.IsNullOrEmpty(hostname) || (port ?? 0) == 0)
+                            throw new FormatException("One balancing target is not formatted correctly");
+
+                        newBalancingTargets.Add(new HostInfo(hostname, port.Value), weight);
                     }
-                    catch (Exception e)
+                }
+
+                if (newBalancingTargets.Count == 0)
+                    logger.Info("There are no balancing target defined. All connections will be skipped");
+
+                List<HostInfo> newCloningTargets = new List<HostInfo>();
+
+                JArray cloningArray = settingsObject["Cloning"] as JArray;
+                if (cloningArray != null)
+                {
+                    foreach (JObject targetObject in cloningArray)
                     {
-                        logger.Warn($"Could not connect to output {mainTargetInfo.Hostname}:{mainTargetInfo.Port}. Skipping connection. {e}");
-                        return;
+                        string hostname = (targetObject["Hostname"] as JValue)?.Value<string>();
+                        ushort? port = (targetObject["Port"] as JValue)?.Value<ushort>();
+                        bool enabled = (targetObject["Enabled"] as JValue)?.Value<bool>() ?? true;
+
+                        if (!enabled)
+                            continue;
+                        if (string.IsNullOrEmpty(hostname) || (port ?? 0) == 0)
+                            throw new FormatException("One cloning target is not formatted correctly");
+
+                        newCloningTargets.Add(new HostInfo(hostname, port.Value));
+                    }
+                }
+
+                settingsObject = settingsObject["Settings"] as JObject;
+                if (settingsObject == null)
+                    throw new Exception("Settings must be defined");
+
+                ushort newPort = (settingsObject["Port"] as JValue)?.Value<ushort>() ?? 0;
+                ulong newBufferSize = (settingsObject["BufferSize"] as JValue)?.Value<ulong>() ?? defaultBufferSize;
+                int newTimeoutMs = (settingsObject["Timeout"] as JValue)?.Value<int>() ?? defaultTimeout;
+
+                string newBalancingModeString = (settingsObject["Balancing"] as JValue)?.Value<string>() ?? defaultBalancingMode.ToString();
+                BalancingMode newBalancingMode;
+                if (!Enum.TryParse(newBalancingModeString, true, out newBalancingMode))
+                    throw new Exception("Invalid balancing mode specified");
+
+                if (newPort == 0)
+                    throw new Exception("A listening port must be defined");
+
+                string newSplitterModeString = (settingsObject["Mode"] as JValue)?.Value<string>() ?? (newPort == 80 ? SplitterMode.Tcp : SplitterMode.Tcp).ToString();
+                SplitterMode newSplitterMode;
+                if (!Enum.TryParse(newSplitterModeString, true, out newSplitterMode))
+                    throw new Exception("Invalid splitter mode specified");
+
+                // Apply settings if needed
+                if (newBalancingMode != BalancingMode)
+                {
+                    BalancingMode = newBalancingMode;
+                    logger.Info($"Setting balancing mode: {BalancingMode}");
+                }
+
+                if (newBufferSize != BufferSize)
+                {
+                    BufferSize = newBufferSize;
+                    logger.Info($"Setting buffer size: {BufferSize}");
+                }
+
+                if (newTimeoutMs != (int)Timeout.TotalMilliseconds)
+                {
+                    Timeout = TimeSpan.FromMilliseconds(newTimeoutMs);
+                    logger.Info($"Setting timeout: {Timeout}");
+                }
+
+                Func<Dictionary<HostInfo, double>, int> balancingTargetHasher = b =>
+                {
+                    int hash = 0x12345678;
+
+                    foreach (var pair in b)
+                    {
+                        hash <<= 8;
+                        hash ^= pair.Key.GetHashCode();
+                        hash <<= 8;
+                        hash ^= pair.Value.GetHashCode();
                     }
 
-                    Dictionary<TargetInfo, TargetConnection> outputTargets = currentOutputTargets.ToDictionary<TargetInfo, TargetInfo, TargetConnection>(t => t, t => null);
+                    return hash;
+                };
+                if (balancingTargetHasher(balancingTargets) != balancingTargetHasher(newBalancingTargets))
+                {
+                    Interlocked.Exchange(ref balancingTargets, newBalancingTargets);
+                    logger.Info($"{newBalancingTargets.Count} balancing targets:");
 
-                    ClientConnection clientConnection = new ClientConnection(client, client.GetStream(), mainTarget, outputTargets);
+                    foreach (var pair in newBalancingTargets)
+                        logger.Info($"- {pair.Key} (Weight: {pair.Value})");
 
-                    lock (activeConnections)
-                        activeConnections.Add(clientConnection);
+                    balancingTargetsTotal = newBalancingTargets.Sum(p => p.Value);
+                    foreach (var pair in newBalancingTargets)
+                        currentBalancing.GetOrAdd(pair.Key, 0);
+                }
 
-                    logger.Info($"Got connection from {clientEndPoint}, {activeConnections.Count} active connections");
+                Func<List<HostInfo>, int> cloningTargetHasher = b =>
+                {
+                    int hash = 0x07654321;
 
-                    // Connect to output targets
-                    foreach (var outputInfo in clientConnection.OutputTargets.ToArray())
+                    foreach (HostInfo hostInfo in b)
                     {
-                        try
-                        {
-                            TcpClient outputClient = new TcpClient();
-
-                            Task connectTask = outputClient.ConnectAsync(outputInfo.Key.Hostname, outputInfo.Key.Port);
-                            if (!connectTask.Wait(currentTimeout))
-                            {
-                                logger.Warn($"Could not connect to output {outputInfo.Key.Hostname}:{outputInfo.Key.Port} after {currentTimeout}. Output will be skipped");
-                                continue;
-                            }
-
-                            TargetConnection outputConnection = new TargetConnection(outputInfo.Key, outputClient, outputClient.GetStream());
-                            clientConnection.OutputTargets[outputInfo.Key] = outputConnection;
-                        }
-                        catch (Exception e)
-                        {
-                            logger.Warn($"Could not connect to output {outputInfo.Key.Hostname}:{outputInfo.Key.Port}. Output will be skipped. {e}");
-                        }
+                        hash <<= 8;
+                        hash ^= hostInfo.GetHashCode();
                     }
 
-                    // Client > Target
-                    new Thread(() =>
+                    return hash;
+                };
+                if (cloningTargetHasher(cloningTargets) != cloningTargetHasher(newCloningTargets))
+                {
+                    Interlocked.Exchange(ref cloningTargets, newCloningTargets);
+                    logger.Info($"{newCloningTargets.Count} cloning targets");
+
+                    foreach (HostInfo hostInfo in newCloningTargets)
+                        logger.Info($"- {hostInfo}");
+                }
+
+                if (newPort != Port || newSplitterMode != SplitterMode)
+                {
+                    logger.Info($"Starting {newSplitterMode} splitter on port {newPort}");
+
+                    Port = newPort;
+                    SplitterMode = newSplitterMode;
+
+                    splitter?.Stop();
+
+                    switch (newSplitterMode)
                     {
-                        Exception exception = null;
-
-                        try
-                        {
-                            byte[] buffer = new byte[bufferSize];
-
-                            while (true)
-                            {
-                                int read = clientConnection.Stream.Read(buffer, 0, buffer.Length);
-                                if (read == 0)
-                                    break;
-
-                                foreach (var targetInfo in outputTargets.ToArray())
-                                {
-                                    if (targetInfo.Value == null)
-                                        continue;
-
-                                    ulong totalSize = (ulong)targetInfo.Value.Buffers.Count * bufferSize + bufferSize;
-                                    if (totalSize > currentBufferSize)
-                                    {
-                                        logger.Warn($"Output target {targetInfo.Key.Hostname}:{targetInfo.Key.Port} has reach its maximum buffer size. Output will be skipped");
-
-                                        outputTargets[targetInfo.Key] = null;
-                                        Try(targetInfo.Value.Connection.Close);
-
-                                        continue;
-                                    }
-
-                                    targetInfo.Value.Buffers.Enqueue(new ArraySegment<byte>(buffer, 0, read));
-                                }
-
-                                mainTarget.Stream.Write(buffer, 0, read);
-                                mainTarget.Stream.Flush();
-
-                                buffer = new byte[bufferSize];
-                            }
-                        }
-                        catch (Exception e)
-                        {
-                            exception = e;
-                        }
-                        finally
-                        {
-                            Try(mainTarget.Connection.Close);
-
-                            foreach (TargetConnection targetConnection in outputTargets.Values)
-                                if (targetConnection != null)
-                                    Try(targetConnection.Connection.Close);
-
-                            lock (activeConnections)
-                            {
-                                if (activeConnections.Remove(clientConnection))
-                                {
-                                    if (exception != null)
-                                    {
-                                        if (!(exception is IOException) || !(exception.InnerException is SocketException))
-                                            logger.Warn("Exception while reading from client. " + exception);
-                                    }
-
-                                    logger.Info($"Lost connection from {clientEndPoint}, {activeConnections.Count} active connections");
-                                }
-                            }
-                        }
-                    }).Start();
-
-                    // Target > Client
-                    new Thread(() =>
-                    {
-                        Exception exception = null;
-
-                        try
-                        {
-                            byte[] buffer = new byte[bufferSize];
-
-                            while (true)
-                            {
-                                int read = mainTarget.Stream.Read(buffer, 0, buffer.Length);
-                                if (read == 0)
-                                    break;
-
-                                clientConnection.Stream.Write(buffer, 0, read);
-                                clientConnection.Stream.Flush();
-                            }
-                        }
-                        catch (Exception e)
-                        {
-                            exception = e;
-                        }
-                        finally
-                        {
-                            Try(client.Close);
-
-                            foreach (TargetConnection targetConnection in outputTargets.Values)
-                                if (targetConnection != null)
-                                    Try(targetConnection.Connection.Close);
-
-                            lock (activeConnections)
-                            {
-                                if (activeConnections.Remove(clientConnection))
-                                {
-                                    if (exception != null)
-                                    {
-                                        if (!(exception is IOException) || !(exception.InnerException is SocketException))
-                                            logger.Warn("Exception while reading from target. " + exception);
-                                    }
-
-                                    logger.Info($"Lost connection from {clientEndPoint}, {activeConnections.Count} active connections");
-                                }
-                            }
-                        }
-                    }).Start();
-
-                    // Flush output target connections
-                    byte[] readBuffer = new byte[bufferSize];
-
-                    while (true)
-                    {
-                        int outputTargetCount = 0;
-                        int dequeuedBuffers = 0;
-
-                        foreach (var outputInfo in clientConnection.OutputTargets.ToArray())
-                        {
-                            if (outputInfo.Value == null)
-                                continue;
-
-                            outputTargetCount++;
-
-                            try
-                            {
-                                ArraySegment<byte> buffer;
-                                while (outputInfo.Value.Buffers.TryDequeue(out buffer))
-                                {
-                                    dequeuedBuffers++;
-
-                                    outputInfo.Value.Stream.Write(buffer.Array, buffer.Offset, buffer.Count);
-                                    outputInfo.Value.Stream.Flush();
-                                }
-
-                                while (outputInfo.Value.Stream.DataAvailable)
-                                    outputInfo.Value.Stream.Read(readBuffer, 0, readBuffer.Length);
-                            }
-                            catch
-                            {
-                                logger.Warn($"Could not send buffer to output target {outputInfo.Key.Hostname}:{outputInfo.Key.Port}. Output will be skipped");
-
-                                outputTargets[outputInfo.Key] = null;
-                                Try(outputInfo.Value.Connection.Close);
-
-                                continue;
-                            }
-                        }
-
-                        if (outputTargetCount == 0)
-                            break;
-
-                        if (dequeuedBuffers == 0)
-                            Thread.Sleep(10);
+                        case SplitterMode.Tcp: splitter = new TcpSplitter(Port, TargetBalancer, TargetCloner); break;
+                        case SplitterMode.Http: splitter = new HttpSplitter(Port, TargetBalancer, TargetCloner); break;
                     }
-                }).Start();
+
+                    splitter.HostConnected += Splitter_HostConnected;
+                    splitter.HostDisconnected += Splitter_HostDisconnected;
+
+                    splitter.Start();
+                }
             }
-            catch (Exception e)
+            catch (Exception ex)
             {
-                logger.Warn($"Error while processing TCP client. " + e);
+                logger.Warn($"Error while parsing {settingsFileName}. Last settings will be kept. " + ex);
+                return;
             }
-
-            tcpListener.BeginAcceptTcpClient(OnTcpConnection, null);
         }
 
-        private static TargetInfo ReadTarget(XElement targetElement)
+        private static void Splitter_HostConnected(object sender, HostInfo source)
         {
-            if (targetElement == null)
-                throw new ArgumentNullException(nameof(targetElement));
-
-            XAttribute hostnameAttribute = targetElement.Attribute("Hostname");
-            if (hostnameAttribute == null)
-                throw new Exception("You must specify a Hostname to this target");
-
-            string hostname = hostnameAttribute.Value;
-            ushort port = currentPort;
-
-            XAttribute portAttribute = targetElement.Attribute("Port");
-            if (portAttribute != null)
-            {
-                if (!ushort.TryParse(portAttribute.Value, out port))
-                    throw new Exception("The specified port for this target is invalid");
-            }
-
-            return new TargetInfo(hostname, port);
         }
-        private static void Try(Action action)
+        private static void Splitter_HostDisconnected(object sender, HostInfo source)
         {
-            try
+            HostInfo target;
+            activeConnections.TryRemove(source, out target);
+
+            int targetConnections;
+            lock (currentBalancing)
             {
-                action();
+                targetConnections = currentBalancing[target] - 1;
+                currentBalancing[target] = targetConnections;
             }
-            catch { }
+
+            logger.Info($"{source} disconnected from {target} ({activeConnections.Count} total, {targetConnections} on target)");
+        }
+
+        private static HostInfo TargetBalancer(HostInfo source)
+        {
+            HostInfo target = null;
+
+            if (BalancingMode == BalancingMode.Random)
+            {
+                double random = balancingTargetsRandom.NextDouble() * balancingTargetsTotal;
+                double current = 0;
+
+                foreach (var pair in balancingTargets)
+                {
+                    current += pair.Value;
+
+                    if (random <= current)
+                    {
+                        target = pair.Key;
+                        break;
+                    }
+                }
+            }
+            else if (BalancingMode == BalancingMode.Consistent)
+            {
+                int hash = source.Hostname.GetHashCode();
+
+                lock (balancingTargets)
+                    target = balancingTargets.ElementAtOrDefault(hash % balancingTargets.Count).Key;
+            }
+            else if (BalancingMode == BalancingMode.Balanced)
+            {
+                target = currentBalancing.OrderBy(p => p.Value).FirstOrDefault().Key;
+            }
+
+            if (target != null)
+            {
+                activeConnections[source] = target;
+
+                int targetConnections;
+                lock (currentBalancing)
+                {
+                    targetConnections = currentBalancing[target] + 1;
+                    currentBalancing[target] = targetConnections;
+                }
+
+                logger.Info($"{source} connected to {target} ({activeConnections.Count} total, {targetConnections} on target)");
+            }
+            else
+            {
+                logger.Info($"No balancing target, {source} will be skipped");
+            }
+
+            return target;
+        }
+        private static IEnumerable<HostInfo> TargetCloner(HostInfo source)
+        {
+            return cloningTargets;
         }
     }
 }

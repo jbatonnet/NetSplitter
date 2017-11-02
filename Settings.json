@@ -1,0 +1,15 @@
+﻿{
+    "Settings":
+    {
+        "Port": 80
+    },
+    "Balancing":
+    [
+        { "Hostname": "msr-orw-bn01", "Port": 80 },
+        { "Hostname": "msr-orw-bn02", "Port": 80 }
+    ],
+    "Cloning":
+    [
+        //{ "Hostname": "mtl-be338", "Port": 17000 }
+    ]
+}
