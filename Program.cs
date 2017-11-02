@@ -112,7 +112,6 @@ namespace NetSplitter
     {
         private const int defaultBufferSize = 1 * 1024 * 1024;
         private const int defaultTimeout = 1000;
-        private const BalancingMode defaultBalancingMode = BalancingMode.LeastConn;
 
         private const string settingsFileName = "Settings.json";
 
@@ -275,24 +274,41 @@ namespace NetSplitter
                 ulong newBufferSize = (settingsObject["BufferSize"] as JValue)?.Value<ulong>() ?? defaultBufferSize;
                 int newTimeoutMs = (settingsObject["Timeout"] as JValue)?.Value<int>() ?? defaultTimeout;
 
-                string newBalancingModeString = (settingsObject["Balancing"] as JValue)?.Value<string>() ?? defaultBalancingMode.ToString();
-                BalancingMode newBalancingMode;
-                if (!Enum.TryParse(newBalancingModeString, true, out newBalancingMode))
-                    throw new Exception("Invalid balancing mode specified");
-
                 if (newPort == 0)
                     throw new Exception("A listening port must be defined");
 
-                string newSplitterModeString = (settingsObject["Mode"] as JValue)?.Value<string>() ?? (newPort == 80 ? SplitterMode.Tcp : SplitterMode.Tcp).ToString();
+                string newSplitterModeString = (settingsObject["Mode"] as JValue)?.Value<string>();
                 SplitterMode newSplitterMode;
-                if (!Enum.TryParse(newSplitterModeString, true, out newSplitterMode))
+
+                if (string.IsNullOrEmpty(newSplitterModeString))
+                {
+                    if (newPort == 80 || newPort == 8080)
+                        newSplitterMode = SplitterMode.Http;
+                    else
+                        newSplitterMode = SplitterMode.Tcp;
+                }
+                else if (!Enum.TryParse(newSplitterModeString, true, out newSplitterMode))
                     throw new Exception("Invalid splitter mode specified");
+
+                string newBalancingModeString = (settingsObject["Balancing"] as JValue)?.Value<string>();
+                BalancingMode newBalancingMode;
+
+                if (string.IsNullOrEmpty(newBalancingModeString))
+                {
+                    if (newSplitterMode == SplitterMode.Http)
+                        newBalancingMode = BalancingMode.IPHash;
+                    else
+                        newBalancingMode = BalancingMode.LeastConn;
+                }
+                else if (!Enum.TryParse(newBalancingModeString, true, out newBalancingMode))
+                    throw new Exception("Invalid balancing mode specified");
 
                 // Apply settings if needed
                 if (newBalancingMode != BalancingMode)
                 {
                     BalancingMode = newBalancingMode;
-                    logger.Info($"Setting balancing mode: {BalancingMode}");
+                    if (Port != 0)
+                        logger.Info($"Setting balancing mode: {BalancingMode}");
                 }
 
                 if (newBufferSize != BufferSize)
@@ -359,21 +375,33 @@ namespace NetSplitter
                 {
                     logger.Info($"Starting {newSplitterMode} splitter on port {newPort}");
 
-                    Port = newPort;
-                    SplitterMode = newSplitterMode;
-
                     splitter?.Stop();
 
-                    switch (newSplitterMode)
+                    try
                     {
-                        case SplitterMode.Tcp: splitter = new TcpSplitter(Port, TargetBalancer, TargetCloner); break;
-                        case SplitterMode.Http: splitter = new HttpSplitter(Port, TargetBalancer, TargetCloner); break;
+                        Splitter newSplitter = null;
+
+                        switch (newSplitterMode)
+                        {
+                            case SplitterMode.Tcp: newSplitter = new TcpSplitter(newPort, TargetBalancer, TargetCloner); break;
+                            case SplitterMode.Http: newSplitter = new HttpSplitter(newPort, TargetBalancer, TargetCloner); break;
+                        }
+
+                        splitter = newSplitter;
+                    }
+                    catch
+                    {
+                        splitter?.Start();
+                        throw;
                     }
 
                     splitter.HostConnected += Splitter_HostConnected;
                     splitter.HostDisconnected += Splitter_HostDisconnected;
 
                     splitter.Start();
+
+                    Port = newPort;
+                    SplitterMode = newSplitterMode;
                 }
             }
             catch (Exception ex)
@@ -407,29 +435,32 @@ namespace NetSplitter
                 return null;
 
             HostInfo target = null;
-
-            if (BalancingMode == BalancingMode.Random)
+            Func<Random, HostInfo> randomSelector = random =>
             {
-                double random = balancingTargetsRandom.NextDouble() * balancingTargetsTotal;
+                double value = random.NextDouble() * balancingTargetsTotal;
                 double current = 0;
 
                 foreach (var pair in balancingTargets)
                 {
                     current += pair.Value;
 
-                    if (random <= current)
-                    {
-                        target = pair.Key;
-                        break;
-                    }
+                    if (value <= current)
+                        return pair.Key;
                 }
+
+                return null;
+            };
+
+            if (BalancingMode == BalancingMode.Random)
+            {
+                target = randomSelector(balancingTargetsRandom);
             }
             else if (BalancingMode == BalancingMode.IPHash)
             {
                 int hash = source.Hostname.GetHashCode();
+                Random random = new Random(hash);
 
-                lock (balancingTargets)
-                    target = balancingTargets.ElementAtOrDefault(hash % balancingTargets.Count).Key;
+                target = randomSelector(random);
             }
             else if (BalancingMode == BalancingMode.LeastConn)
             {

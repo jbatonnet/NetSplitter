@@ -29,8 +29,6 @@ namespace NetSplitter
 
         public HttpSplitter(ushort port, Func<HostInfo, HostInfo> targetBalancer, Func<HostInfo, IEnumerable<HostInfo>> targetCloner) : base(targetBalancer, targetCloner)
         {
-            throw new NotImplementedException();
-
             Port = port;
 
             httpListener = new HttpListener();
@@ -75,19 +73,142 @@ namespace NetSplitter
                     // Create a HttpWebRequest
                     Func<HostInfo, HttpWebRequest> requestBuilder = (HostInfo target) =>
                     {
-                        Uri uri = new Uri(new Uri($"http://{target.Hostname}:{target.Port}"), context.Request.Url);
+                        Uri uri = new Uri(new Uri($"http://{target.Hostname}:{target.Port}"), context.Request.RawUrl);
                         HttpWebRequest request = WebRequest.CreateHttp(uri);
 
-                        foreach (string key in context.Request.Headers.Keys)
-                            request.Headers.Add(key, context.Request.Headers[key]);
+                        // Copy headers
+                        string xff = "";
 
+                        foreach (string key in context.Request.Headers.Keys)
+                        {
+                            string value = context.Request.Headers[key];
+
+                            switch (key.ToLower())
+                            {
+                                case "connection":
+                                    if (value.ToLower() == "keep-alive")
+                                        request.KeepAlive = true;
+                                    else
+                                        request.Connection = value;
+                                    break;
+
+                                case "host": break;
+                                case "accept": request.Accept = value; break;
+                                case "user-agent": request.UserAgent = value; break;
+                                case "x-forwarded-for": xff = value; break;
+                                case "content-length": request.ContentLength = int.Parse(value); break;
+                                case "content-type": request.ContentType = value; break;
+                                case "referer": request.Referer = value; break;
+
+                                default:
+                                    request.Headers.Add(key, value);
+                                    break;
+                            }
+                        }
+
+                        request.Method = context.Request.HttpMethod;
+                        request.Host = $"{target.Hostname}:{target.Port}";
+                        request.Headers["X-Forwarded-For"] = string.IsNullOrEmpty(xff) ? clientInfo.Hostname : $"{xff}, {clientInfo.Hostname}";
+                        
                         return request;
                     };
 
-                    requestBuilder(mainTargetInfo);
-                });
+                    // Copy stream if needed
+                    Stream requestStream = context.Request.InputStream;
+
+                    HostInfo[] otherTargets = targetCloner(clientInfo).ToArray();
+                    if (otherTargets.Length > 0)
+                    {
+                        MemoryStream bufferedStream = new MemoryStream();
+                        requestStream.CopyTo(bufferedStream);
+                        requestStream = bufferedStream;
+
+                        requestStream.Seek(0, SeekOrigin.Begin);
+                    }
+
+                    // Execute request and copy stream
+                    HttpWebRequest mainTargetRequest = requestBuilder(mainTargetInfo);
+
+                    if (context.Request.HttpMethod != "GET")
+                    {
+                        using (Stream mainTargetStream = mainTargetRequest.GetRequestStream())
+                            requestStream.CopyTo(mainTargetStream);
+                    }
+
+                    // Send request to secondary targets
+                    new Thread(() =>
+                    {
+                        foreach (HostInfo target in otherTargets)
+                        {
+                            HttpWebRequest targetRequest = requestBuilder(target);
+
+                            if (context.Request.HttpMethod != "GET")
+                            {
+                                requestStream.Seek(0, SeekOrigin.Begin);
+
+                                using (Stream targetStream = targetRequest.GetRequestStream())
+                                    requestStream.CopyTo(targetStream);
+                            }
+
+                            try
+                            {
+                                targetRequest.GetResponse();
+                            }
+                            catch { }
+                        }
+                    }).Start();
+
+                    HttpWebResponse mainTargetResponse;
+
+                    try
+                    {
+                        mainTargetResponse = mainTargetRequest.GetResponse() as HttpWebResponse;
+                    }
+                    catch (WebException e)
+                    {
+                        mainTargetResponse = e.Response as HttpWebResponse;
+                    }
+
+                    // Copy headers
+                    foreach (string key in mainTargetResponse.Headers.Keys)
+                    {
+                        string value = mainTargetResponse.Headers[key];
+
+                        switch (key.ToLower())
+                        {
+                            case "transfer-encoding": break;
+                            case "content-length": context.Response.ContentLength64 = int.Parse(value); break;
+
+                            default:
+                                context.Response.Headers.Add(key, value);
+                                break;
+                        }
+                    }
+
+                    context.Response.StatusCode = (int)mainTargetResponse.StatusCode;
+
+                    try
+                    {
+                        using (Stream mainTargetStream = mainTargetResponse.GetResponseStream())
+                            mainTargetStream.CopyTo(context.Response.OutputStream);
+                    }
+                    catch (Exception e)
+                    {
+                        logger.Warn($"Error while writing HTTP response. The client might have disconnected. " + e);
+                    }
+
+                    context.Response.Close();
+
+                    HostDisconnected?.Invoke(this, clientInfo);
+                }).Start();
+
             }
-            catch { }
+            catch (Exception e)
+            {
+                logger.Warn($"Error while processing HTTP client. " + e);
+            }
+
+            httpListener.BeginGetContext(OnHttpConnection, null);
         }
     }
 }
