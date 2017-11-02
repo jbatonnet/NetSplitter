@@ -30,13 +30,13 @@ namespace NetSplitter
         public HttpSplitter(ushort port, Func<HostInfo, HostInfo> targetBalancer, Func<HostInfo, IEnumerable<HostInfo>> targetCloner) : base(targetBalancer, targetCloner)
         {
             Port = port;
-
-            httpListener = new HttpListener();
-            httpListener.Prefixes.Add($"http://+:{port}/");
         }
 
         public override void Start()
         {
+            httpListener = new HttpListener();
+            httpListener.Prefixes.Add($"http://+:{Port}/");
+
             httpListener.Start();
 
             running = true;
@@ -45,7 +45,16 @@ namespace NetSplitter
         public override void Stop()
         {
             running = false;
-            httpListener.Stop();
+
+            try
+            {
+                httpListener.Stop();
+                httpListener.Close();
+            }
+            catch
+            {
+                httpListener = null;
+            }
         }
 
         private void OnHttpConnection(IAsyncResult asyncResult)
@@ -86,11 +95,16 @@ namespace NetSplitter
                             switch (key.ToLower())
                             {
                                 case "connection":
-                                    if (value.ToLower() == "keep-alive")
-                                        request.KeepAlive = true;
-                                    else
-                                        request.Connection = value;
+                                {
+                                    switch (value.ToLower())
+                                    {
+                                        case "keep-alive": request.KeepAlive = true; break;
+                                        case "close": break;
+                                        default: request.Connection = value; break;
+                                    }
+
                                     break;
+                                }
 
                                 case "host": break;
                                 case "accept": request.Accept = value; break;

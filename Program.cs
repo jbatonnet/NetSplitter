@@ -433,6 +433,8 @@ namespace NetSplitter
         {
             if (balancingTargets.Count == 0)
                 return null;
+            if (balancingTargets.Count == 1)
+                return balancingTargets.Keys.First();
 
             HostInfo target = null;
             Func<Random, HostInfo> randomSelector = random =>
