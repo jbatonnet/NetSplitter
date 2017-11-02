@@ -417,7 +417,8 @@ namespace NetSplitter
         private static void Splitter_HostDisconnected(object sender, HostInfo source)
         {
             HostInfo target;
-            activeConnections.TryRemove(source, out target);
+            if (!activeConnections.TryRemove(source, out target))
+                return;
 
             int targetConnections;
             lock (currentBalancing)
@@ -431,42 +432,45 @@ namespace NetSplitter
 
         private static HostInfo TargetBalancer(HostInfo source)
         {
-            if (balancingTargets.Count == 0)
-                return null;
-            if (balancingTargets.Count == 1)
-                return balancingTargets.Keys.First();
-
             HostInfo target = null;
-            Func<Random, HostInfo> randomSelector = random =>
-            {
-                double value = random.NextDouble() * balancingTargetsTotal;
-                double current = 0;
 
-                foreach (var pair in balancingTargets)
+            if (balancingTargets.Count == 1)
+            {
+                target = balancingTargets.Keys.First();
+            }
+            else if (balancingTargets.Count > 1)
+            {
+                Func<Random, HostInfo> randomSelector = random =>
                 {
-                    current += pair.Value;
+                    double value = random.NextDouble() * balancingTargetsTotal;
+                    double current = 0;
 
-                    if (value <= current)
-                        return pair.Key;
+                    foreach (var pair in balancingTargets)
+                    {
+                        current += pair.Value;
+
+                        if (value <= current)
+                            return pair.Key;
+                    }
+
+                    return null;
+                };
+
+                if (BalancingMode == BalancingMode.Random)
+                {
+                    target = randomSelector(balancingTargetsRandom);
                 }
+                else if (BalancingMode == BalancingMode.IPHash)
+                {
+                    int hash = source.Hostname.GetHashCode();
+                    Random random = new Random(hash);
 
-                return null;
-            };
-
-            if (BalancingMode == BalancingMode.Random)
-            {
-                target = randomSelector(balancingTargetsRandom);
-            }
-            else if (BalancingMode == BalancingMode.IPHash)
-            {
-                int hash = source.Hostname.GetHashCode();
-                Random random = new Random(hash);
-
-                target = randomSelector(random);
-            }
-            else if (BalancingMode == BalancingMode.LeastConn)
-            {
-                target = balancingTargets.OrderBy(p => currentBalancing[p.Key] / p.Value).FirstOrDefault().Key;
+                    target = randomSelector(random);
+                }
+                else if (BalancingMode == BalancingMode.LeastConn)
+                {
+                    target = balancingTargets.OrderBy(p => currentBalancing[p.Key] / p.Value).FirstOrDefault().Key;
+                }
             }
 
             if (target != null)
