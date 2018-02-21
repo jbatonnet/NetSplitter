@@ -95,13 +95,16 @@ namespace NetSplitter
 
         private void Log(string message)
         {
+            DateTime now = DateTime.Now;
+            string stampedMessage = string.Format("[{0:dd/MM} {0:HH:mm:ss}]{1}", now, message);
+
             lock (mutex)
             {
-                Console.WriteLine(message);
+                Console.WriteLine(string.Format("[{0:HH:mm:ss}]{1}", now, message));
 
                 try
                 {
-                    File.AppendAllText("NetSplitter.log", message + Environment.NewLine);
+                    File.AppendAllText("NetSplitter.log", string.Format("[{0:dd/MM} {0:HH:mm:ss}]{1}{2}", now, message, Environment.NewLine));
                 }
                 catch { }
             }
@@ -210,6 +213,9 @@ namespace NetSplitter
                 using (FileStream fileStream = File.Open(settingsFileName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 using (StreamReader streamReader = new StreamReader(fileStream))
                     settingsJson = streamReader.ReadToEnd();
+
+                if (string.IsNullOrWhiteSpace(settingsJson))
+                    return;
 
                 settingsObject = JObject.Parse(settingsJson);
             }

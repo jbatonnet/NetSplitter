@@ -113,6 +113,8 @@ namespace NetSplitter
                     catch (Exception e)
                     {
                         logger.Warn($"Could not connect to output {mainTargetInfo.Hostname}:{mainTargetInfo.Port}. Skipping connection. {e}");
+
+                        HostDisconnected?.Invoke(this, clientInfo);
                         return;
                     }
 
@@ -315,13 +317,17 @@ namespace NetSplitter
             tcpListener.BeginAcceptTcpClient(OnTcpConnection, null);
         }
 
-        private static void Try(Action action)
+        private static bool Try(Action action)
         {
             try
             {
                 action();
+                return true;
             }
-            catch { }
+            catch
+            {
+                return false;
+            }
         }
     }
 }
