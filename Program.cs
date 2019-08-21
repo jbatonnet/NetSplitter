@@ -7,9 +7,8 @@ using System.Linq;
 using System.Reflection;
 using System.Threading;
 
-using log4net;
-using log4net.Core;
 using Newtonsoft.Json.Linq;
+
 using PInvoke;
 
 namespace NetSplitter
@@ -26,15 +25,13 @@ namespace NetSplitter
         LeastConn
     }
 
-    class DefaultLogger : ILog
+    class DefaultLogger
     {
         public bool IsDebugEnabled => true;
         public bool IsErrorEnabled => true;
         public bool IsFatalEnabled => true;
         public bool IsInfoEnabled => true;
         public bool IsWarnEnabled => true;
-
-        public ILogger Logger => null;
 
         public void Debug(object message)
         {
@@ -96,7 +93,6 @@ namespace NetSplitter
         private void Log(string message)
         {
             DateTime now = DateTime.Now;
-            string stampedMessage = string.Format("[{0:dd/MM} {0:HH:mm:ss}]{1}", now, message);
 
             lock (mutex)
             {
@@ -125,7 +121,8 @@ namespace NetSplitter
         public static ulong BufferSize { get; private set; } = defaultBufferSize;
         public static TimeSpan Timeout { get; private set; } = TimeSpan.FromMilliseconds(defaultTimeout);
 
-        private static readonly ILog logger = new DefaultLogger(); // LogManager.GetLogger(typeof(Program));
+        private static readonly DefaultLogger logger = new DefaultLogger();
+
         private static FileSystemWatcher fileSystemWatcher;
         private static Kernel32.HandlerRoutine consoleCtrlHandler;
 
@@ -288,7 +285,7 @@ namespace NetSplitter
 
                 if (string.IsNullOrEmpty(newSplitterModeString))
                 {
-                    if (newPort == 80 || newPort == 8080)
+                    if (newPort == 80 || newPort == 1080 || newPort == 8080)
                         newSplitterMode = SplitterMode.Http;
                     else
                         newSplitterMode = SplitterMode.Tcp;
@@ -404,7 +401,15 @@ namespace NetSplitter
                     splitter.HostConnected += Splitter_HostConnected;
                     splitter.HostDisconnected += Splitter_HostDisconnected;
 
-                    splitter.Start();
+                    try
+                    {
+                        splitter.Start();
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.Warn($"Error while starting listener. " + ex);
+                        return;
+                    }
 
                     Port = newPort;
                     SplitterMode = newSplitterMode;
@@ -412,7 +417,15 @@ namespace NetSplitter
             }
             catch (Exception ex)
             {
-                logger.Warn($"Error while parsing {settingsFileName}. Last settings will be kept. " + ex);
+                if (Port == 0)
+                {
+                    logger.Warn($"Error while parsing {settingsFileName}. Exiting. " + ex);
+                }
+                else
+                {
+                    logger.Warn($"Error while parsing {settingsFileName}. Last settings will be kept. " + ex);
+                }
+
                 return;
             }
         }

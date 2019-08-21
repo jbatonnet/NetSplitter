@@ -1,14 +1,9 @@
 ﻿using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Net.Sockets;
 using System.Threading;
-using System.Threading.Tasks;
-
-using log4net;
 
 namespace NetSplitter
 {
@@ -16,7 +11,7 @@ namespace NetSplitter
     {
         private const int bufferSize = 32 * 1024;
 
-        private static readonly ILog logger = new DefaultLogger(); // LogManager.GetLogger(typeof(HttpSplitter));
+        private static readonly DefaultLogger logger = new DefaultLogger();
 
         public ushort Port { get; }
 

@@ -8,8 +8,6 @@ using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 
-using log4net;
-
 namespace NetSplitter
 {
     public class TargetConnection
@@ -50,7 +48,7 @@ namespace NetSplitter
     {
         private const int bufferSize = 32 * 1024;
 
-        private static readonly ILog logger = new DefaultLogger(); // LogManager.GetLogger(typeof(TcpSplitter));
+        private static readonly DefaultLogger logger = new DefaultLogger();
 
         public ushort Port { get; }
 

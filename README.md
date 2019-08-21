@@ -60,4 +60,4 @@ Here is a sample configuration file
     - **.Weight**: Weight of this target. A greater weight means it will be choosen more often. Default is 1
     - **.Enabled**: Use false to disable this target
 
-If not specified, NetSplitter will automatically choose HTTP mode and IPHash balancing if you specify port 80 or 8080.
+If not specified, NetSplitter will automatically choose HTTP mode and IPHash balancing if you specify port 80, 1080 or 8080.

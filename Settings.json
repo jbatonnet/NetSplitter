@@ -1,16 +1,11 @@
 ﻿{
     "Settings":
     {
-        "Port": 80,
-        //"Balancing": "IPHash"
+        "Port": 1080,
+        "Mode": "Tcp"
     },
     "Balancing":
     [
-        { "Hostname": "msr-orw-bn01", "Port": 80 },
-        { "Hostname": "msr-orw-bn02", "Port": 80 }
-    ],
-    "Cloning":
-    [
-        //{ "Hostname": "mtl-be338", "Port": 8080 }
+        { "Hostname": "example.com", "Port": 80 }
     ]
 }
